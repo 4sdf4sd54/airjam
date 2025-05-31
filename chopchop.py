@@ -11,7 +11,7 @@ conf.verb = 0
 def parse_args():
     parser = argparse.ArgumentParser(description="airjam.py — Advanced WEP Chop-Chop Attack Tool")
     parser.add_argument("--chop-chop", action="store_true", help="Enable Chop-Chop Attack")
-    parser.add_argument("-b", "--bssid", required=True, help="Target BSSID (e.g. 00:11:22:33:44:55)")
+    parser.add_argument("-a", "--bssid", required=True, help="Target BSSID (e.g. 00:11:22:33:44:55)")
     parser.add_argument("-m", "--mac", required=True, help="Your MAC address")
     parser.add_argument("interface", help="Wireless interface in monitor mode")
     args = parser.parse_args()
