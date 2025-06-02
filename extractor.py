@@ -12,6 +12,24 @@ def get_ssid(packets):
                 continue
     return None
 
+def zero_mic(eapol_raw):
+    # Zero MIC field at offset 81-97 bytes (16 bytes)
+    if len(eapol_raw) >= 97:
+        return eapol_raw[:81] + b'\x00' * 16 + eapol_raw[97:]
+    else:
+        return eapol_raw
+
+def format_hex_bytes(data, bytes_per_line=16):
+    hex_str = data.hex()
+    # Split into 2-char chunks (bytes)
+    bytes_list = [hex_str[i:i+2] for i in range(0, len(hex_str), 2)]
+    # Group bytes per line
+    lines = []
+    for i in range(0, len(bytes_list), bytes_per_line):
+        line_bytes = bytes_list[i:i+bytes_per_line]
+        lines.append(' '.join(line_bytes))
+    return '\n'.join(lines)
+
 def extract_handshake_info(filename):
     packets = rdpcap(filename)
     ssid = get_ssid(packets)
@@ -43,32 +61,38 @@ def extract_handshake_info(filename):
             ack = (key_info & (1 << 7)) != 0
             install = (key_info & (1 << 6)) != 0
 
-            # --- FIX: Prefer scapy field, else raw offset (17:49 is standard for WPA2, adjust if needed) ---
-            if hasattr(eapol.payload, 'nonce') and isinstance(getattr(eapol.payload, 'nonce', None), bytes):
-                nonce = eapol.payload.nonce.hex()
-            else:
-                nonce = eapol_raw[17:49].hex()
-
+            # Extract nonce from EAPOL (bytes 17-49)
+            nonce = eapol_raw[17:49].hex()
             mic_val = eapol_raw[81:97].hex()
 
-            # Message 1: ANonce, from AP to STA, first seen!
-            if not mic_present and ack and anonce is None:
+            # Message 1 of 4-way handshake: ANonce (from AP to Client)
+            if not mic_present and ack and not install and anonce is None:
                 anonce = nonce
                 ap_mac = src
                 client_mac = dst
 
-            # Message 2: SNonce + MIC, from client to AP
-            elif mic_present and not ack and not install:
-                if not snonce:
-                    snonce = nonce
-                if not mic:
-                    mic = mic_val
-                if not eapol2or4_raw:
-                    eapol2or4_raw = eapol_raw.hex()
-                    if not ap_mac:
-                        ap_mac = bssid if bssid != src else dst
-                    if not client_mac:
-                        client_mac = src
+            # Message 2 or 4: SNonce + MIC (from Client to AP)
+            elif mic_present and snonce is None:
+                snonce = nonce
+                mic = mic_val
+                # zero MIC field
+                eapol_clean = zero_mic(eapol_raw)
+
+                # Read EAPOL payload length (bytes 2 and 3)
+                length = int.from_bytes(eapol_clean[2:4], 'big')
+                total_len = 4 + length  # 4 bytes header + length field
+
+                # Slice EAPOL to correct length to avoid trailing garbage
+                if total_len <= len(eapol_clean):
+                    eapol_clean = eapol_clean[:total_len]
+
+                eapol2or4_raw = eapol_clean
+
+                # Assign AP and client MAC if not already
+                if not ap_mac:
+                    ap_mac = bssid if bssid != src else dst
+                if not client_mac:
+                    client_mac = src
 
     if not (anonce and snonce and mic and eapol2or4_raw and ssid and ap_mac and client_mac):
         print("Failed to extract all required handshake parameters.")
@@ -78,7 +102,7 @@ def extract_handshake_info(filename):
         print(f"ANonce: {anonce if anonce else 'Not found'}")
         print(f"SNonce: {snonce if snonce else 'Not found'}")
         print(f"MIC: {mic if mic else 'Not found'}")
-        print(f"EAPOL: {eapol2or4_raw if eapol2or4_raw else 'Not found'}")
+        print(f"EAPOL (msg 2 or 4, raw hex): {'Not found'}")
         sys.exit(3)
 
     print(f"SSID: {ssid}")
@@ -87,7 +111,9 @@ def extract_handshake_info(filename):
     print(f"ANonce: {anonce}")
     print(f"SNonce: {snonce}")
     print(f"MIC: {mic}")
-    print(f"EAPOL (msg 2 or 4, raw hex): {eapol2or4_raw}")
+    print(f"EAPOL (msg 2 or 4, raw hex, MIC zeroed):")
+    print(format_hex_bytes(eapol2or4_raw))
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
