@@ -14,6 +14,7 @@ import pyclamd
 import signal
 import base64
 import secrets
+import socket
 
 from PySide6 import QtCore, QtWidgets, QtGui
 import qtawesome as qta
@@ -314,21 +315,38 @@ class VTXCoreDaemon(threading.Thread):
             result = self.clamd.scan_file(path)
             if result:
                 status = result[path][0]
-                logging.warning(f"Infected: {path} ({status})")
-                alert = f"🛑 Virus detected: {status}\nFile: {path}\nKeep or Quarantine?"
-                app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
-                reply = QtWidgets.QMessageBox.warning(
-                    None, "VTX Alert", alert,
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
-                if reply == QtWidgets.QMessageBox.No:
-                    quarantine_file(path)
-                    notify("VTX", f"File quarantined: {path}")
-                else:
-                    notify("VTX", f"File kept: {path}")
+                if status == "FOUND":
+                    logging.warning(f"Infected: {path} ({status})")
+                    alert = f"🛑 Virus detected: {status}\nFile: {path}\nKeep or Quarantine?"
+                    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+                    reply = QtWidgets.QMessageBox.warning(
+                        None, "VTX Alert", alert,
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+                    if reply == QtWidgets.QMessageBox.No:
+                        quarantine_file(path)
+                        notify("VTX", f"File quarantined: {path}")
+                    else:
+                        notify("VTX", f"File kept: {path}")
+                elif status == "ERROR":
+                    logging.error(f"ClamAV scan error for {path}, skipping quarantine.")
+                # "OK" or others are ignored
         except Exception as e:
             logging.error(f"Error scanning {path}: {e}")
 
-def start_mitmproxy(port=8080):
+def find_free_port(start_port=8080, max_tries=20):
+    port = start_port
+    for _ in range(max_tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(('127.0.0.1', port))
+                return port
+            except OSError:
+                port += 1
+    raise RuntimeError("No free ports found")
+
+def start_mitmproxy(port=None):
+    if port is None:
+        port = find_free_port(8080, 20)
     ca_cert = install_mitmproxy_ca()
     set_firefox_proxy(port)
     addon_path = create_mitm_addon()
@@ -341,7 +359,7 @@ def start_mitmproxy(port=8080):
 
 def watchdog_loop():
     while True:
-        if not any("av.py" in p.cmdline() for p in psutil.process_iter()):
+        if not any("av.py" in " ".join(p.cmdline()) for p in psutil.process_iter()):
             logging.info("Agent not running, restarting")
             os.execv(sys.executable, [sys.executable] + sys.argv)
         time.sleep(10)
@@ -400,9 +418,12 @@ class AVMainWindow(QtWidgets.QMainWindow):
                 res = clamd.scan_file(full)
                 if res:
                     status = res[full][0]
-                    QtWidgets.QMessageBox.warning(self, "VTX Alert",
-                        f"🛑 Virus detected: {status}\nFile: {full}\nKeep or Quarantine?")
-                    quarantine_file(full)
+                    if status == "FOUND":
+                        QtWidgets.QMessageBox.warning(self, "VTX Alert",
+                            f"🛑 Virus detected: {status}\nFile: {full}\nKeep or Quarantine?")
+                        quarantine_file(full)
+                    elif status == "ERROR":
+                        logging.error(f"ClamAV scan error for {full}, skipping.")
         self.status.setText("Scan finished.")
 
     def show_quarantine(self):
@@ -443,7 +464,8 @@ def main():
     tempdirs = [tempfile.gettempdir(), "/tmp"]
     daemon = VTXCoreDaemon(downloads, tempdirs)
     daemon.start()
-    mitm_thread = threading.Thread(target=start_mitmproxy, kwargs={"port": 8080}, daemon=True)
+    mitm_port = find_free_port(8080, 20)
+    mitm_thread = threading.Thread(target=start_mitmproxy, kwargs={"port": mitm_port}, daemon=True)
     mitm_thread.start()
     wd = threading.Thread(target=watchdog_loop, daemon=True)
     wd.start()
